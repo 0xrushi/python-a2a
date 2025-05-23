@@ -353,6 +353,9 @@ class A2AServer(BaseA2AServer):
             """Root endpoint for A2A (POST) - handle message in appropriate format"""
             try:
                 data = request.json
+                # Check if this is a JSON-RPC request
+                if isinstance(data, dict) and "jsonrpc" in data:
+                    return self._handle_jsonrpc_request(data)
                 
                 # First, detect if this is Google A2A format (has 'parts' field)
                 is_google_format = False
@@ -382,8 +385,8 @@ class A2AServer(BaseA2AServer):
                         "role": "agent",
                         "parts": [
                             {
-                                "type": "data",
-                                "data": {"error": error_msg}
+                                "kind": "text",
+                                "text": error_msg
                             }
                         ]
                     }), 500
@@ -424,6 +427,11 @@ class A2AServer(BaseA2AServer):
         # Also support the standard agent.json at the root
         @app.route("/agent.json", methods=["GET"])
         def agent_card():
+            """Return the agent card as JSON (standard location)"""
+            return jsonify(self.agent_card.to_dict())
+
+        @app.route("/.well-known/agent.json", methods=["GET"])
+        def well_known_agent_card():
             """Return the agent card as JSON (standard location)"""
             return jsonify(self.agent_card.to_dict())
         
@@ -744,7 +752,13 @@ class A2AServer(BaseA2AServer):
             # Convert to the appropriate format for response
             if is_google_format or self._use_google_a2a:
                 # Use Google A2A format for response
-                return jsonify(response.to_google_a2a())
+                response_dict = response.to_google_a2a()
+                # Ensure we have the correct format for Google A2A
+                if "parts" in response_dict:
+                    for part in response_dict["parts"]:
+                        if "type" in part:
+                            part["kind"] = part.pop("type")
+                return jsonify(response_dict)
             else:
                 # Use standard python_a2a format
                 return jsonify(response.to_dict())
@@ -756,8 +770,8 @@ class A2AServer(BaseA2AServer):
                     "role": "agent",
                     "parts": [
                         {
-                            "type": "data",
-                            "data": {"error": error_msg}
+                            "kind": "text",
+                            "text": error_msg
                         }
                     ]
                 }), 500
@@ -1073,6 +1087,202 @@ class A2AServer(BaseA2AServer):
             return jsonify({
                 "jsonrpc": "2.0",
                 "id": rpc_id,
+                "error": {
+                    "code": -32603,
+                    "message": f"Internal error: {str(e)}"
+                }
+            }), 500
+
+    def _handle_jsonrpc_request(self, data):
+        """Handle JSON-RPC formatted requests"""
+        try:
+            method = data.get("method", "")
+            params = data.get("params", {})
+            rpc_id = data.get("id", 1)
+            
+            if method == "message/send":
+                # Handle message/send method
+                # Extract message from params
+                message_data = params.get("message", {})
+                
+                # Create a task from the message
+                task = Task(
+                    id=str(uuid.uuid4()),
+                    message=message_data,
+                    status=TaskStatus(state=TaskState.SUBMITTED)
+                )
+                
+                # Process the task
+                try:
+                    result = self.handle_task(task)
+                except Exception as e:
+                    raise
+                
+                # Create response message
+                response_message = {
+                    "messageId": str(uuid.uuid4()),
+                    "role": "agent",
+                    "parts": []
+                }
+                
+                # Extract text from artifacts
+                if result.artifacts:
+                    for artifact in result.artifacts:
+                        if "parts" in artifact:
+                            for part in artifact["parts"]:
+                                if part.get("kind") == "text":
+                                    response_message["parts"].append({
+                                        "kind": "text",
+                                        "text": part.get("text", "")
+                                    })
+                
+                # Create a Task object for the response
+                task_response = {
+                    "id": str(uuid.uuid4()),
+                    "kind": "task",
+                    "contextId": str(uuid.uuid4()),
+                    "status": {
+                        "state": "completed",
+                        "timestamp": datetime.now().isoformat()
+                    },
+                    "artifacts": [{
+                        "artifactId": str(uuid.uuid4()),
+                        "parts": [{
+                            "kind": "text",
+                            "text": part.get("text", "")
+                        } for part in response_message["parts"]]
+                    }] if response_message["parts"] else []
+                }
+                
+                # Return JSON-RPC response in the exact format expected by the client
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "result": task_response
+                }
+                print("DEBUG: Final response:", response)  # Debug log
+                return jsonify(response)
+            
+            elif method == "message/stream":
+                # Handle streaming request
+                message_data = params.get("message", {})
+                task_id = str(uuid.uuid4())
+                context_id = str(uuid.uuid4())
+                
+                def generate_sse_stream():
+                    """Generate a Server-Sent Events stream for task execution"""
+                    # Send initial task state
+                    initial_task = {
+                        "id": task_id,
+                        "kind": "task",
+                        "contextId": context_id,
+                        "status": {
+                            "state": "submitted",
+                            "timestamp": datetime.now().isoformat()
+                        }
+                    }
+                    response = {
+                        "jsonrpc": "2.0",
+                        "id": rpc_id,
+                        "result": initial_task
+                    }
+                    yield f"event: update\nid: {rpc_id}\ndata: {json.dumps(response)}\n\n"
+                    
+                    # Process the task
+                    try:
+                        task = Task(
+                            id=task_id,
+                            message=message_data,
+                            status=TaskStatus(state=TaskState.SUBMITTED)
+                        )
+                        result = self.handle_task(task)
+                        
+                        # Send artifact updates
+                        if result.artifacts:
+                            for artifact in result.artifacts:
+                                artifact_event = {
+                                    "kind": "artifact-update",
+                                    "taskId": task_id,
+                                    "contextId": context_id,
+                                    "artifact": {
+                                        "artifactId": str(uuid.uuid4()),
+                                        "parts": artifact.get("parts", [])
+                                    }
+                                }
+                                response = {
+                                    "jsonrpc": "2.0",
+                                    "id": rpc_id,
+                                    "result": artifact_event
+                                }
+                                yield f"event: update\nid: {rpc_id}\ndata: {json.dumps(response)}\n\n"
+                        
+                        # Send final status
+                        final_status = {
+                            "kind": "status-update",
+                            "taskId": task_id,
+                            "contextId": context_id,
+                            "status": {
+                                "state": "completed",
+                                "timestamp": datetime.now().isoformat()
+                            },
+                            "final": True
+                        }
+                        response = {
+                            "jsonrpc": "2.0",
+                            "id": rpc_id,
+                            "result": final_status
+                        }
+                        yield f"event: update\nid: {rpc_id}\ndata: {json.dumps(response)}\n\n"
+                        
+                    except Exception as e:
+                        # Send error status
+                        error_status = {
+                            "kind": "status-update",
+                            "taskId": task_id,
+                            "contextId": context_id,
+                            "status": {
+                                "state": "failed",
+                                "message": {"error": str(e)},
+                                "timestamp": datetime.now().isoformat()
+                            },
+                            "final": True
+                        }
+                        response = {
+                            "jsonrpc": "2.0",
+                            "id": rpc_id,
+                            "result": error_status
+                        }
+                        yield f"event: update\nid: {rpc_id}\ndata: {json.dumps(response)}\n\n"
+                
+                # Create a streaming response with proper SSE content type
+                return Response(
+                    stream_with_context(generate_sse_stream()),
+                    content_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no"
+                    }
+                )
+            
+            else:
+                # Unknown method
+                return jsonify({
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "error": {
+                        "code": -32601,
+                        "message": f"Method '{method}' not found"
+                    }
+                }), 404
+                
+        except Exception as e:
+            print("DEBUG: Error in _handle_jsonrpc_request:", str(e))  # Debug log
+            import traceback
+            print("DEBUG: Traceback:", traceback.format_exc())  # Debug log
+            return jsonify({
+                "jsonrpc": "2.0",
+                "id": data.get("id", 1),
                 "error": {
                     "code": -32603,
                     "message": f"Internal error: {str(e)}"
